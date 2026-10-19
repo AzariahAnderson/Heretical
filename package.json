@@ -1,4 +1,35 @@
-{"name":"heretical","private":true,"type":"module","version":"1.0.0",
-"scripts":{"dev":"concurrently -k \"vite\" \"tsx watch --env-file=.env server/index.ts\"","build":"vite build","start":"NODE_ENV=production tsx --env-file=.env server/index.ts"},
-"dependencies":{"@fontsource-variable/inter":"^5.1.0","@hono/node-server":"^1.13.0","gsap":"^3.12.5","hono":"^4.6.0","react":"^19.0.0","react-dom":"^19.0.0","react-markdown":"^10.0.0","remark-gfm":"^4.0.0","shiki":"^3.0.0","zustand":"^5.0.0"},
-"devDependencies":{"@types/node":"^22.0.0","@types/react":"^19.0.0","@types/react-dom":"^19.0.0","@vitejs/plugin-react":"^5.0.0","concurrently":"^9.0.0","tsx":"^4.19.0","typescript":"^5.6.0","vite":"^7.0.0"}}
+{
+    "name": "heretical",
+    "private": true,
+    "type": "module",
+    "version": "1.0.0",
+    "scripts": {
+        "dev": "concurrently -k -n WEB,API \"vite --host 127.0.0.1 --clearScreen false\" \"node --env-file=.env --import tsx --watch server/index.ts\"",
+        "build": "vite build",
+        "start": "node --env-file=.env --import tsx server/start-production.ts"
+    },
+    "dependencies": {
+        "@fontsource-variable/inter": "^5.1.0",
+        "@hono/node-server": "^1.13.0",
+        "gsap": "^3.12.5",
+        "hono": "^4.6.0",
+        "lucide-react": "^1.59.0",
+        "react": "^19.0.0",
+        "react-dom": "^19.0.0",
+        "react-markdown": "^10.0.0",
+        "remark-gfm": "^4.0.0",
+        "shiki": "^3.0.0",
+        "simple-icons": "^16.35.0",
+        "zustand": "^5.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.0.0",
+        "@types/react": "^19.0.0",
+        "@types/react-dom": "^19.0.0",
+        "@vitejs/plugin-react": "^5.0.0",
+        "concurrently": "^9.0.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.6.0",
+        "vite": "^7.0.0"
+    }
+}

@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react'
+import { X } from 'lucide-react';
 import gsap from 'gsap'
 export default function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   const r = useRef<HTMLDivElement>(null)

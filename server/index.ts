@@ -3,141 +3,365 @@ import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { streamSSE } from 'hono/streaming'
 
-type P = { base: string; keys: string[]; models: string[] }
-const k = (...n: string[]) => n.map(x => process.env[x]).filter(Boolean) as string[]
-const PROVIDERS: Record<string, P> = {
-  groq: { base: 'https://api.groq.com/openai/v1', keys: k('GROQ_API_KEY', 'GROQ_API_KEY_FALLBACK'), models: ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b'] },
-  gemini: { base: 'https://generativelanguage.googleapis.com/v1beta/openai', keys: k('GEMINI_API_KEY'), models: ['gemini-2.5-flash', 'gemini-2.5-pro'] },
-  openrouter: { base: 'https://openrouter.ai/api/v1', keys: k('OPENROUTER_API_KEY'), models: ['meta-llama/llama-3.3-70b-instruct:free', 'deepseek/deepseek-chat-v3.1:free'] },
-  venice: { base: 'https://api.venice.ai/api/v1', keys: k('VENICE_API_KEY', 'VENICE_API_KEY_FALLBACK'), models: ['venice-uncensored', 'llama-3.3-70b'] },
-  pollinations: { base: 'https://text.pollinations.ai/openai', keys: k('POLLINATIONS_API_KEY', 'POLLINATIONS_API_KEY_FALLBACK'), models: ['openai', 'mistral'] },
-  huggingface: { base: 'https://router.huggingface.co/v1', keys: k('HF_TOKEN'), models: ['meta-llama/Llama-3.3-70B-Instruct'] },
-  mistral: { base: 'https://api.mistral.ai/v1', keys: k('MISTRAL_API_KEY'), models: ['mistral-large-latest'] },
-  cerebras: { base: 'https://api.cerebras.ai/v1', keys: k('CEREBRAS_API_KEY'), models: ['llama-3.3-70b'] },
+type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
+type Provider = { base: string; envKeys: string[]; safeModels: string[]; gate?: string; kind: 'openai' | 'gemini' | 'openrouter' }
+type CatalogModel = { id: string; provider: string; name: string }
+type Json = Record<string, any>
+
+const FREE_ONLY = String(process.env.FREE_ONLY ?? 'true').toLowerCase() !== 'false'
+const MAXTOK = Math.max(256, Math.min(Number(process.env.MAX_OUTPUT_TOKENS) || 768, 4096))
+const TURNS = Math.max(1, Math.min(Number(process.env.HISTORY_TURNS) || 12, 30))
+const LIMIT = Math.max(1, Math.min(Number(process.env.LOCAL_RATE_LIMIT) || 8, 60))
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT?.trim() || `You are HERETICAL, a highly capable assistant especially strong at software engineering. Be direct, accurate and warm; skip filler and needless caveats. Lead with the answer, then explain. Never invent facts or claim to have run code that you did not run. For code, provide complete, runnable examples and handle errors.`
+
+// No paid-only providers are registered. Provider access requires a fresh key and a local free-tier confirmation.
+const PROVIDERS: Record<string, Provider> = {
+  groq: {
+    base: 'https://api.groq.com/openai/v1', envKeys: ['GROQ_API_KEY', 'GROQ_API_KEY_FALLBACK'],
+    safeModels: ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b'],
+    gate: 'GROQ_FREE_PLAN_CONFIRMED', kind: 'openai'
+  },
+  gemini: {
+    base: 'https://generativelanguage.googleapis.com/v1beta/openai', envKeys: ['GEMINI_API_KEY', 'GEMINI_API_KEY_FALLBACK'],
+    safeModels: ['gemini-3.6-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'],
+    gate: 'GEMINI_FREE_TIER_CONFIRMED', kind: 'gemini'
+  },
+  openrouter: {
+    base: 'https://openrouter.ai/api/v1', envKeys: ['OPENROUTER_API_KEY'],
+    safeModels: ['openrouter/free'], kind: 'openrouter'
+  },
+  cerebras: {
+    base: 'https://api.cerebras.ai/v1', envKeys: ['CEREBRAS_API_KEY'],
+    safeModels: ['gpt-oss-120b', 'zai-glm-4.7'],
+    gate: 'CEREBRAS_FREE_PLAN_CONFIRMED', kind: 'openai'
+  },
+  mistral: {
+    base: 'https://api.mistral.ai/v1', envKeys: ['MISTRAL_API_KEY'],
+    safeModels: ['mistral-small-latest'], gate: 'MISTRAL_FREE_MODE_CONFIRMED', kind: 'openai'
+  }
 }
-const MAXTOK = Number(process.env.MAX_OUTPUT_TOKENS) || 1024
-const TURNS = Number(process.env.HISTORY_TURNS) || 12
-const LIMIT = Number(process.env.LOCAL_RATE_LIMIT) || 8
-const SYS = (process.env.SYSTEM_PROMPT || `You are HERETICAL, a highly capable assistant that is especially strong at software engineering. Be direct, accurate and warm; skip filler, flattery and needless caveats. Lead with the answer, then the reasoning. Break hard problems into steps and check your work. If you are unsure, say so instead of guessing. For code: give complete, runnable code in fenced blocks tagged with the language, name files when there are several, use modern idioms, handle errors, and explain only the non-obvious choices. For web demos, put everything in one self-contained html block so it can be previewed. Use headings only in long answers. Use emoji sparingly, only where natural.`)
 
-const hits = new Map<string, number[]>()
 const app = new Hono()
+const hits = new Map<string, number[]>()
+const modelCache = new Map<string, { at: number; models: string[] }>()
+const CACHE_MS = 3 * 60 * 1000
 
-app.get('/api/models', c => c.json(Object.entries(PROVIDERS).filter(([, p]) => p.keys.length)
-  .flatMap(([id, p]) => p.models.map(m => ({ id: `${id}:${m}`, provider: id, name: m.split('/').pop() })))))
+function providerKeys(id: string): string[] {
+  const p = PROVIDERS[id]
+  if (!p || !FREE_ONLY) return []
+  if (p.gate && String(process.env[p.gate] || '').toLowerCase() !== 'true') return []
+  if (id === 'openrouter' && String(process.env.OPENROUTER_FREE_ONLY ?? 'true').toLowerCase() === 'false') return []
+  return p.envKeys.map(name => process.env[name]?.trim()).filter((v): v is string => Boolean(v))
+}
+function enabledProviders(): string[] { return Object.keys(PROVIDERS).filter(id => providerKeys(id).length > 0) }
+function normalizedModelId(v: unknown): string { return String(v || '').replace(/^models\//, '').trim() }
+function priceIsZero(v: unknown): boolean { return v !== null && v !== undefined && Number.isFinite(Number(v)) && Number(v) === 0 }
+async function fetchWithTimeout(url: string, init: RequestInit = {}, ms = 4500): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), ms)
+  try { return await fetch(url, { ...init, signal: controller.signal }) }
+  finally { clearTimeout(timer) }
+}
+function authHeaders(key: string): Record<string, string> { return { authorization: `Bearer ${key}`, 'content-type': 'application/json' } }
+
+async function discoverModels(id: string, force = false): Promise<string[]> {
+  const cached = modelCache.get(id)
+  if (!force && cached && Date.now() - cached.at < CACHE_MS) return cached.models
+  const p = PROVIDERS[id]
+  const keys = providerKeys(id)
+  if (!p || !keys.length) return []
+  let models: string[] = []
+  let querySucceeded = false
+  for (const key of keys) {
+    try {
+      if (id === 'openrouter') {
+        const res = await fetchWithTimeout(`${p.base}/models`, { headers: { authorization: `Bearer ${key}` } })
+        if (!res.ok) continue
+        querySucceeded = true
+        const data = ((await res.json()) as Json).data || []
+        const free = data.filter((m: Json) => typeof m.id === 'string' && m.id.endsWith(':free') &&
+          priceIsZero(m.pricing?.prompt) && priceIsZero(m.pricing?.completion))
+          .map((m: Json) => String(m.id)).slice(0, 24)
+        models = ['openrouter/free', ...free.filter((m: string) => m !== 'openrouter/free')]
+        break
+      }
+      if (id === 'gemini') {
+        const res = await fetchWithTimeout('https://generativelanguage.googleapis.com/v1beta/models', { headers: { 'x-goog-api-key': key } })
+        if (!res.ok) continue
+        querySucceeded = true
+        const payload = await res.json() as Json
+        const online = (payload.models || []).filter((m: Json) => (m.supportedGenerationMethods || []).includes('generateContent'))
+          .map((m: Json) => normalizedModelId(m.name))
+        models = p.safeModels.filter(m => online.includes(m))
+        break
+      }
+      const res = await fetchWithTimeout(`${p.base}/models`, { headers: { authorization: `Bearer ${key}` } })
+      if (!res.ok) continue
+      querySucceeded = true
+      const payload = await res.json() as Json
+      const online = (payload.data || []).map((m: Json) => normalizedModelId(m.id))
+      models = p.safeModels.filter(m => online.includes(m))
+      break
+    } catch {
+      // Try the next configured key before returning the curated free-only catalogue.
+    }
+  }
+  if (models.length === 0 && !querySucceeded) {
+    // Network outages should not hide known free candidates; every request still passes provider/model allowlists.
+    models = id === 'openrouter' ? ['openrouter/free'] : [...p.safeModels]
+  }
+  modelCache.set(id, { at: Date.now(), models })
+  return models
+}
+function providerAndModel(raw: unknown): { providerId: string; modelId: string } | undefined {
+  const value = String(raw || '')
+  const sep = value.indexOf(':')
+  if (sep <= 0 || sep === value.length - 1) return undefined
+  const providerId = value.slice(0, sep)
+  const modelId = value.slice(sep + 1)
+  const p = PROVIDERS[providerId]
+  if (!p || !providerKeys(providerId).length) return undefined
+  if (providerId === 'openrouter') {
+    if (modelId !== 'openrouter/free' && !modelId.endsWith(':free')) return undefined
+  } else if (!p.safeModels.includes(modelId)) return undefined
+  return { providerId, modelId }
+}
+function rateLimited(c: any): boolean {
+  const ip = (c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'local').split(',')[0].trim().slice(0, 100)
+  const now = Date.now()
+  const recent = (hits.get(ip) || []).filter(t => now - t < 60_000)
+  if (recent.length >= LIMIT) { hits.set(ip, recent); return true }
+  recent.push(now); hits.set(ip, recent)
+  return false
+}
+function requestMessages(input: unknown, persona?: unknown): ChatMessage[] {
+  const arr = Array.isArray(input) ? input : []
+  const clean: ChatMessage[] = arr.slice(-TURNS * 2).filter((m: any) => m && (m.role === 'user' || m.role === 'assistant'))
+    .map((m: any) => ({ role: m.role, content: String(m.content ?? '').slice(0, 24000) }))
+    .filter(m => m.content.trim().length > 0)
+  const personaText = String(persona || '').trim().slice(0, 1500)
+  return [{ role: 'system', content: `${SYSTEM_PROMPT}${personaText ? `\nUser preferences: ${personaText}` : ''}` }, ...clean]
+}
+function safeErr(text: string, status: number): string {
+  let message = text
+  try {
+    const j = JSON.parse(text)
+    message = typeof j.error === 'string' ? j.error : (j.error?.message || j.message || text)
+  } catch { /* keep text */ }
+  message = String(message || `HTTP ${status}`).replace(/[\r\n\t]+/g, ' ').slice(0, 260)
+  return `HTTP ${status}: ${message}`
+}
+async function makeCompletion(id: string, model: string, messages: any[], opts: Json = {}, signal?: AbortSignal): Promise<{ response?: Response; error?: string }> {
+  const p = PROVIDERS[id]
+  let error = 'Provider request failed'
+  for (const key of providerKeys(id)) {
+    try {
+      // Keep the timeout/caller abort signal attached to the response body so Stop really cancels streaming.
+      const timeoutSignal = AbortSignal.timeout(90_000)
+      const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+      const res = await fetch(`${p.base}/chat/completions`, {
+        method: 'POST', headers: authHeaders(key),
+        body: JSON.stringify({ model, messages, max_tokens: MAXTOK, ...opts }),
+        signal: requestSignal
+      })
+      if (res.ok) return { response: res }
+      error = safeErr(await res.text().catch(() => ''), res.status)
+    } catch (e: any) {
+      error = e?.name === 'AbortError' ? 'The provider request timed out or was cancelled.' : 'Network connection to the provider failed.'
+      if (signal?.aborted) break
+    }
+  }
+  return { error }
+}
+
+async function streamCompletion(res: Response, send: (data: Json) => Promise<void>, signal: AbortSignal): Promise<void> {
+  if (!res.body) throw new Error('The provider returned an empty response stream.')
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  async function processEvent(event: string): Promise<boolean> {
+    const data = event.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n')
+    if (!data) return false
+    if (data === '[DONE]') return true
+    try {
+      const payload = JSON.parse(data) as Json
+      const delta = payload.choices?.[0]?.delta?.content
+      if (typeof delta === 'string' && delta) await send({ t: delta })
+      else if (Array.isArray(delta)) {
+        const text = delta.map((part: Json) => typeof part?.text === 'string' ? part.text : '').join('')
+        if (text) await send({ t: text })
+      }
+      if (payload.error) await send({ e: String(payload.error.message || payload.error).slice(0, 240) })
+    } catch { /* Some providers send keep-alive or non-JSON events; ignore them. */ }
+    return false
+  }
+  while (!signal.aborted) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const events = buffer.split(/\r?\n\r?\n/)
+    buffer = events.pop() || ''
+    for (const event of events) if (await processEvent(event)) { await reader.cancel().catch(() => {}); return }
+  }
+  if (!signal.aborted && buffer.trim()) await processEvent(buffer)
+  try { await reader.cancel() } catch { /* stream already closed */ }
+}
+
+app.get('/api/health', c => c.json({
+  ok: true,
+  freeOnly: FREE_ONLY,
+  paidProvidersDisabled: true,
+  port: Number(process.env.PORT) || 8787,
+  providers: enabledProviders().map(id => ({ id, name: id === 'openrouter' ? 'OpenRouter Free' : id, configured: true }))
+}))
+
+app.get('/api/providers', c => c.json({ freeOnly: FREE_ONLY, providers: enabledProviders() }))
+app.get('/api/models', async c => {
+  const ids = enabledProviders()
+  const grouped = await Promise.all(ids.map(async id => {
+    const names = await discoverModels(id)
+    return names.map(model => ({
+      id: `${id}:${model}`, provider: id,
+      name: model === 'openrouter/free' ? 'Auto · Free models' : model.split('/').pop()?.replace(/:free$/, '') || model
+    } as CatalogModel))
+  }))
+  return c.json(grouped.flat())
+})
 
 app.post('/api/chat', async c => {
-  const ip = c.req.header('x-forwarded-for') || 'local', now = Date.now()
-  const h = (hits.get(ip) || []).filter(t => now - t < 60000)
-  if (h.length >= LIMIT) return c.json({ error: 'Slow down — rate limit reached.' }, 429)
-  hits.set(ip, [...h, now])
-  const { model, messages, persona } = await c.req.json<{ model: string; messages: { role: string; content: string }[]; persona?: string }>()
-  const [pid, ...rest] = String(model).split(':'); const p = PROVIDERS[pid]
-  if (!p?.keys.length) return c.json({ error: 'Model unavailable.' }, 400)
-  const mk = (m: string) => JSON.stringify({ model: m, stream: true, max_tokens: Math.max(MAXTOK, 2048),
-    messages: [{ role: 'system', content: SYS + (persona ? `\nUser persona/instructions: ${String(persona).slice(0, 1500)}` : '') }, ...messages.slice(-TURNS * 2)] })
-  return streamSSE(c, async s => {
-    let res: Response | undefined, err = ''
-    const cands = [[pid, rest.join(':')], ...Object.entries(PROVIDERS).filter(([id, q]) => id !== pid && q.keys.length).map(([id, q]) => [id, q.models[0]])].slice(0, 3)
-    outer: for (const [cid, cm] of cands) for (const key of PROVIDERS[cid].keys) {
-      res = await fetch(`${PROVIDERS[cid].base}/chat/completions`, { method: 'POST', body: mk(cm), headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` } }).catch(() => undefined)
-      if (res?.ok) break outer
-      err = res ? `${res.status} ${(await res.text()).slice(0, 200)}` : 'network error'
+  if (rateLimited(c)) return c.json({ error: 'Local rate limit reached. Please wait a minute before trying again.' }, 429)
+  let body: Json
+  try { body = await c.req.json() as Json } catch { return c.json({ error: 'Request body must be valid JSON.' }, 400) }
+  const selected = providerAndModel(body.model)
+  if (!selected) return c.json({ error: 'That model is unavailable in free-only mode. Refresh the model list and choose an enabled free-tier model.' }, 400)
+  if (!Array.isArray(body.messages) || body.messages.length === 0) return c.json({ error: 'Add a message before sending.' }, 400)
+  const messages = requestMessages(body.messages, body.persona)
+  return streamSSE(c, async stream => {
+    const controller = new AbortController()
+    stream.onAbort(() => controller.abort())
+    const send = async (data: Json) => { if (!controller.signal.aborted) await stream.writeSSE({ data: JSON.stringify(data) }) }
+    const candidateList: Array<{ id: string; model: string }> = [{ id: selected.providerId, model: selected.modelId }]
+    for (const alternative of await discoverModels(selected.providerId)) {
+      if (alternative !== selected.modelId) candidateList.push({ id: selected.providerId, model: alternative })
     }
-    if (!res?.ok || !res.body) return void (await s.writeSSE({ data: JSON.stringify({ e: err || 'failed' }) }))
-    const rd = res.body.getReader(), dec = new TextDecoder(); let buf = ''
-    for (;;) {
-      const { done, value } = await rd.read(); if (done) break
-      buf += dec.decode(value, { stream: true }); const lines = buf.split('\n'); buf = lines.pop()!
-      for (const l of lines) {
-        if (!l.startsWith('data:')) continue; const d = l.slice(5).trim(); if (!d || d === '[DONE]') continue
-        try { const t = JSON.parse(d).choices?.[0]?.delta?.content; if (t) await s.writeSSE({ data: JSON.stringify({ t }) }) } catch {}
+    for (const id of enabledProviders()) {
+      if (id === selected.providerId) continue
+      const alternatives = await discoverModels(id)
+      if (alternatives[0]) candidateList.push({ id, model: alternatives[0] })
+    }
+    let finalError = 'No free-tier provider could complete this request.'
+    for (const candidate of candidateList) {
+      if (controller.signal.aborted) return
+      const result = await makeCompletion(candidate.id, candidate.model, messages, { stream: true }, controller.signal)
+      if (!result.response) { finalError = result.error || finalError; continue }
+      try {
+        await streamCompletion(result.response, send, controller.signal)
+        await send({ done: true, provider: candidate.id, model: candidate.model })
+        return
+      } catch (e: any) {
+        if (controller.signal.aborted) return
+        finalError = String(e?.message || 'The provider stream ended unexpectedly.').slice(0, 240)
       }
     }
-    await s.writeSSE({ data: JSON.stringify({ done: true }) })
+    await send({ e: `${finalError} Check the free-tier account quota, model availability, and server terminal for errors.` })
+    await send({ done: true })
   })
 })
 
 app.post('/api/title', async c => {
-  const { model, text } = await c.req.json<{ model: string; text: string }>()
-  const [pid, ...rest] = String(model).split(':'); const p = PROVIDERS[pid]
-  for (const key of p?.keys || []) {
-    const r = await fetch(`${p.base}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: rest.join(':'), max_tokens: 24, messages: [{ role: 'system', content: 'Write a 2-5 word title for this conversation. Reply with the title only: no quotes, no trailing punctuation.' }, { role: 'user', content: String(text).slice(0, 800) }] }) }).catch(() => undefined)
-    const t = r?.ok ? ((await r.json()) as any).choices?.[0]?.message?.content : ''
-    if (t) return c.json({ title: String(t).replace(/["\n]/g, '').trim().slice(0, 50) })
-  }
-  return c.json({ title: null })
+  let body: Json
+  try { body = await c.req.json() as Json } catch { return c.json({ title: null }, 400) }
+  const selected = providerAndModel(body.model)
+  if (!selected) return c.json({ title: null })
+  const messages = [
+    { role: 'system', content: 'Write a 2–5 word title for the conversation. Output the title only, no quotation marks.' },
+    { role: 'user', content: String(body.text || '').slice(0, 900) }
+  ]
+  const result = await makeCompletion(selected.providerId, selected.modelId, messages, { stream: false, max_tokens: 24 })
+  if (!result.response) return c.json({ title: null })
+  const json = await result.response.json().catch(() => ({})) as Json
+  const title = String(json.choices?.[0]?.message?.content || '').replace(/["\r\n]/g, '').trim().slice(0, 50)
+  return c.json({ title: title || null })
 })
-const fn = (name: string, description: string, props: string[]) => ({ type: 'function', function: { name, description,
-  parameters: { type: 'object', properties: Object.fromEntries(props.map(k => [k, { type: 'string' }])), required: props } } })
-const TOOLS = [fn('write_file', 'Create or overwrite a file with its complete contents', ['path', 'content']), fn('read_file', 'Read a file', ['path']), fn('list_files', 'List all files', []), fn('delete_file', 'Delete a file', ['path'])]
-const AGENT = `You are HERETICAL Agent, an autonomous coding agent in a browser workspace with a live preview.
-Build complete, polished, working projects with vanilla HTML/CSS/JS (no build step; libraries only from https://cdnjs.cloudflare.com). The entry point is index.html, linking style.css and script.js. Plan in one or two sentences, then call write_file for every file with its full contents, never placeholders. To change a file, read_file first, then write_file the full new version. Handle edge cases and make the design modern and responsive. When finished, reply with a short summary and no tool call.`
+
+const fn = (name: string, description: string, props: string[]) => ({
+  type: 'function', function: { name, description, parameters: {
+    type: 'object', properties: Object.fromEntries(props.map(k => [k, { type: 'string' }])), required: props
+  } }
+})
+const TOOLS = [
+  fn('write_file', 'Create or overwrite a workspace file with its complete contents', ['path', 'content']),
+  fn('read_file', 'Read a workspace file', ['path']),
+  fn('list_files', 'List workspace files', []),
+  fn('delete_file', 'Delete a workspace file', ['path'])
+]
+const AGENT_PROMPT = `You are HERETICAL Agent, an AI coding assistant in a browser workspace. Build complete, polished, working projects. Use the workspace tools to create or edit files; never claim files were changed unless a tool call actually changed the in-memory workspace. Entry point is index.html unless the user asks otherwise. Prefer accessible responsive UI and maintainable vanilla HTML/CSS/JS. The workspace exists in the current chat and is not the user's physical disk.`
+function safeWorkspacePath(value: unknown): string {
+  const raw = String(value || '').replace(/\\/g, '/').replace(/^\/+/, '').trim()
+  if (!raw || raw.split('/').some(part => part === '..' || part === '.') || raw.includes('\0') || raw.length > 180) return ''
+  return raw
+}
+
 app.post('/api/agent', async c => {
-  const ip = c.req.header('x-forwarded-for') || 'local', now = Date.now(); const h = (hits.get(ip) || []).filter(t => now - t < 60000)
-  if (h.length >= LIMIT) return c.json({ error: 'Slow down — rate limit reached.' }, 429); hits.set(ip, [...h, now])
-  const { model, messages, files, persona } = await c.req.json<{ model: string; messages: any[]; files: Record<string, string>; persona?: string }>()
-  const [pid, ...rest] = String(model).split(':'); const p = PROVIDERS[pid]
-  if (!p?.keys.length) return c.json({ error: 'Model unavailable.' }, 400)
-  const fs: Record<string, string> = { ...files }
-  return streamSSE(c, async s => {
-    const send = (o: object) => s.writeSSE({ data: JSON.stringify(o) })
-    const msgs: any[] = [{ role: 'system', content: `${AGENT}${persona ? `\nUser persona: ${String(persona).slice(0, 800)}` : ''}\nFiles now: ${Object.keys(fs).join(', ') || '(none)'}` }, ...messages.slice(-TURNS * 2)]
-    for (let i = 0; i < 10; i++) {
-      let j: any, err = ''
-      for (const key of p.keys) {
-        const r = await fetch(`${p.base}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-          body: JSON.stringify({ model: rest.join(':'), messages: msgs, tools: TOOLS, tool_choice: 'auto', max_tokens: Math.max(MAXTOK, 4096) }) }).catch(() => undefined)
-        if (r?.ok) { j = await r.json(); break }
-        err = r ? `${r.status} ${(await r.text()).slice(0, 200)}` : 'network error'
-      }
-      const m = j?.choices?.[0]?.message
-      if (!m) return void (await send({ e: err || 'Empty response' }))
-      msgs.push({ role: 'assistant', content: m.content || null, tool_calls: m.tool_calls })
-      if (m.content) await send({ t: m.content + '\n\n' })
-      if (!m.tool_calls?.length) break
-      for (const tc of m.tool_calls) {
-        let a: any = {}; try { a = JSON.parse(tc.function.arguments || '{}') } catch {}
-        const path = String(a.path || '').replace(/^\/+/, ''); let out = 'ok'
-        if (tc.function.name === 'write_file' && path) { fs[path] = String(a.content ?? ''); await send({ ev: 'file', path, content: fs[path] }) }
-        else if (tc.function.name === 'read_file') { out = fs[path] ?? 'File not found'; await send({ ev: 'step', label: 'read ' + path }) }
-        else if (tc.function.name === 'list_files') { out = Object.keys(fs).join('\n') || '(empty)'; await send({ ev: 'step', label: 'list files' }) }
-        else if (tc.function.name === 'delete_file') { delete fs[path]; await send({ ev: 'del', path }) }
-        else out = 'Invalid call'
-        msgs.push({ role: 'tool', tool_call_id: tc.id, content: out })
+  if (rateLimited(c)) return c.json({ error: 'Local rate limit reached. Please wait a minute before trying again.' }, 429)
+  let body: Json
+  try { body = await c.req.json() as Json } catch { return c.json({ error: 'Request body must be valid JSON.' }, 400) }
+  const selected = providerAndModel(body.model)
+  if (!selected) return c.json({ error: 'Choose an enabled free-tier model first.' }, 400)
+  const files: Record<string, string> = body.files && typeof body.files === 'object' ? { ...body.files } : {}
+  const incoming = requestMessages(body.messages, body.persona).slice(1)
+  const messages: any[] = [{ role: 'system', content: `${AGENT_PROMPT}\nWorkspace files: ${Object.keys(files).join(', ') || '(none)'}` }, ...incoming]
+  return streamSSE(c, async stream => {
+    const controller = new AbortController()
+    stream.onAbort(() => controller.abort())
+    const send = async (o: Json) => { if (!controller.signal.aborted) await stream.writeSSE({ data: JSON.stringify(o) }) }
+    for (let iteration = 0; iteration < 8 && !controller.signal.aborted; iteration++) {
+      const result = await makeCompletion(selected.providerId, selected.modelId, messages, { stream: false, tools: TOOLS, tool_choice: 'auto' }, controller.signal)
+      if (!result.response) { await send({ e: result.error || 'Agent request failed.' }); return }
+      const payload = await result.response.json().catch(() => ({})) as Json
+      const message = payload.choices?.[0]?.message
+      if (!message) { await send({ e: 'The selected model returned no agent message. Try another free model.' }); return }
+      messages.push({ role: 'assistant', content: message.content || null, tool_calls: message.tool_calls })
+      if (message.content) await send({ t: `${message.content}\n\n` })
+      if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) break
+      for (const call of message.tool_calls) {
+        if (controller.signal.aborted) return
+        let args: Json = {}
+        try { args = JSON.parse(call.function?.arguments || '{}') as Json } catch { /* malformed tool JSON gets a safe result */ }
+        const path = safeWorkspacePath(args.path)
+        let output = 'OK'
+        if (call.function?.name === 'write_file' && path) {
+          files[path] = String(args.content ?? '').slice(0, 400000)
+          await send({ ev: 'file', path, content: files[path] })
+          await send({ ev: 'step', label: `write ${path}` })
+        } else if (call.function?.name === 'read_file' && path) {
+          output = files[path] ?? 'File not found.'
+          await send({ ev: 'step', label: `read ${path}` })
+        } else if (call.function?.name === 'list_files') {
+          output = Object.keys(files).join('\n') || '(empty workspace)'
+          await send({ ev: 'step', label: 'list workspace files' })
+        } else if (call.function?.name === 'delete_file' && path) {
+          delete files[path]
+          await send({ ev: 'del', path })
+          await send({ ev: 'step', label: `delete ${path}` })
+        } else output = 'Invalid or unsafe workspace operation.'
+        messages.push({ role: 'tool', tool_call_id: call.id, content: output.slice(0, 400000) })
       }
     }
     await send({ done: true })
   })
 })
 
-const tryKeys = async (keys: string[], f: (key: string) => Promise<string | undefined>) => {
-  for (const key of keys) { try { const r = await f(key); if (r) return r } catch {} } }
-const dataUrl = async (r: Response) => `data:${r.headers.get('content-type')?.split(';')[0] || 'image/jpeg'};base64,${Buffer.from(await r.arrayBuffer()).toString('base64')}`
-const IMG: Record<string, (p: string, w: number, h: number) => Promise<string | undefined>> = {
-  pollinations: (p, w, h) => tryKeys(PROVIDERS.pollinations.keys, async key => {
-    const r = await fetch(`https://image.pollinations.ai/prompt/${encodeURIComponent(p)}?model=flux&width=${w}&height=${h}&nologo=true&seed=${Math.floor(Math.random() * 1e9)}`, { headers: { authorization: `Bearer ${key}` } })
-    return r.ok && r.headers.get('content-type')?.startsWith('image') ? dataUrl(r) : undefined }),
-  venice: (p, w, h) => tryKeys(PROVIDERS.venice.keys, async key => {
-    const r = await fetch('https://api.venice.ai/api/v1/image/generate', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: 'flux-dev', prompt: p, width: Math.min(w, 1280), height: Math.min(h, 1280), format: 'webp', safe_mode: false }) })
-    const j: any = r.ok ? await r.json() : null; return j?.images?.[0] ? `data:image/webp;base64,${j.images[0]}` : undefined }),
-  huggingface: (p) => tryKeys(PROVIDERS.huggingface.keys, async key => {
-    const r = await fetch('https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` }, body: JSON.stringify({ inputs: p }) })
-    return r.ok ? dataUrl(r) : undefined }),
-}
-app.get('/api/image-engines', c => c.json(Object.keys(IMG).filter(k => PROVIDERS[k].keys.length)))
-app.post('/api/image', async c => {
-  const { prompt, engine, ratio } = await c.req.json<{ prompt: string; engine?: string; ratio?: string }>()
-  const [w, h] = ratio === 'wide' ? [1344, 768] : ratio === 'tall' ? [768, 1344] : [1024, 1024]
-  const order = [engine, ...Object.keys(IMG)].filter((x, i, a): x is string => !!x && !!IMG[x] && PROVIDERS[x].keys.length > 0 && a.indexOf(x) === i)
-  for (const e of order) { const image = await IMG[e](String(prompt).slice(0, 1500), w, h).catch(() => undefined); if (image) return c.json({ image, engine: e }) }
-  return c.json({ error: 'Every image engine failed. Try a different prompt.' }, 502)
-})
+// Strict free-only mode deliberately does not call Venice, Hugging Face pay-as-you-go inference,
+// NSFWAI, or Pollinations Pollen APIs. Those may use paid credits; no image model is enabled here.
+app.get('/api/image-engines', c => c.json([]))
+app.post('/api/image', c => c.json({ error: 'Image generation is disabled in strict free-only mode because no configured image provider can be guaranteed to cost $0. Chat and streaming remain available.' }, 503))
 
 if (process.env.NODE_ENV === 'production') {
   app.use('/*', serveStatic({ root: './dist' }))
   app.get('*', serveStatic({ path: './dist/index.html' }))
 }
-serve({ fetch: app.fetch, port: Number(process.env.PORT) || 8787 }, i => console.log(`HERETICAL on :${i.port}`))
+
+const port = Number(process.env.PORT) || 8787
+const host = process.env.HOST || '127.0.0.1'
+serve({ fetch: app.fetch, port, hostname: host }, () => console.log(`HERETICAL API listening at http://${host}:${port} (free-only mode)`))

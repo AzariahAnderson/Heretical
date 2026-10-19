@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Menu, Plus, ChevronDown, ArrowUp, Square, X, ChevronLeft, ChevronRight } from 'lucide-react';
 import gsap from 'gsap'
 import { useStore, type Chat, type Msg } from './store'
 import { putImg } from './db'
@@ -11,7 +12,7 @@ import Logo from './components/Logo'
 import { Ws } from './ws'
 
 type M = { id: string; provider: string; name: string }
-const SUGGEST = ['Explain a hard concept simply', 'Write a TypeScript debounce hook', 'Plan my week 🗓️', 'Debug my code 🐛', '/image a neon dragon over a rainy city']
+const SUGGEST = ['Explain a hard concept simply', 'Write a TypeScript debounce hook', 'Plan my week', 'Debug my code', '/image a neon dragon over a rainy city']
 const PERSONAS = ['Concise senior engineer', 'Patient teacher', 'Blunt editor', 'Creative co-writer']
 const RATIOS = [['square', '1:1'], ['wide', '16:9'], ['tall', '9:16']]
 
@@ -36,6 +37,7 @@ function Bubble({ m, live, last, onRegen, onEdit }: { m: Msg; live?: boolean; la
 export default function App() {
   const { chats, active, model, persona, engine, set, upsert, remove } = useStore()
   const [models, setModels] = useState<M[]>([]); const [engines, setEngines] = useState<string[]>([])
+  const [aiStatus, setAiStatus] = useState('Connecting to AI…')
   const [text, setText] = useState(''); const [busy, setBusy] = useState(false); const [nav, setNav] = useState(false)
   const [img, setImg] = useState(false); const [ratio, setRatio] = useState('square')
   const [ws, setWs] = useState(false); const [agent, setAgent] = useState(false)
@@ -44,10 +46,37 @@ export default function App() {
   const chat = chats.find(c => c.id === active)
 
   useEffect(() => {
-    fetch('/api/models').then(r => r.json()).then((m: M[]) => { setModels(m); if (!m.some(x => x.id === useStore.getState().model) && m[0]) set({ model: m[0].id }) })
-    fetch('/api/image-engines').then(r => r.json()).then(setEngines)
-    const k = (e: KeyboardEvent) => { if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); set({ active: null }); ta.current?.focus() } }
-    addEventListener('keydown', k); return () => removeEventListener('keydown', k)
+    let active = true
+    let retryTimer: number | undefined
+    const loadApi = async () => {
+      try {
+        const healthResponse = await fetch('/api/health', { cache: 'no-store' })
+        if (!healthResponse.ok) throw new Error('API health unavailable')
+        const health = await healthResponse.json()
+        const modelResponse = await fetch('/api/models', { cache: 'no-store' })
+        if (!modelResponse.ok) throw new Error('Model discovery unavailable')
+        const availableModels: M[] = await modelResponse.json()
+        const engineResponse = await fetch('/api/image-engines', { cache: 'no-store' })
+        const availableEngines: string[] = engineResponse.ok ? await engineResponse.json() : []
+        if (!active) return
+        setModels(availableModels)
+        setEngines(availableEngines)
+        if (!availableModels.some(x => x.id === useStore.getState().model) && availableModels[0]) set({ model: availableModels[0].id })
+        setAiStatus(availableModels.length
+          ? `${availableModels.length} free model${availableModels.length === 1 ? '' : 's'} ready`
+          : (health.providers?.length ? 'API online · no eligible free model found' : 'API online · add a free-tier key'))
+      } catch {
+        if (!active) return
+        setAiStatus('Connecting to local AI…')
+        setModels([])
+        setEngines([])
+        retryTimer = window.setTimeout(loadApi, 1400)
+      }
+    }
+    void loadApi()
+    const shortcut = (e: KeyboardEvent) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); set({ active: null }); ta.current?.focus() } }
+    addEventListener('keydown', shortcut)
+    return () => { active = false; if (retryTimer !== undefined) window.clearTimeout(retryTimer); removeEventListener('keydown', shortcut) }
   }, [])
   useEffect(() => { scroller.current?.scrollTo({ top: 1e9 }) }, [chat?.messages])
   const shown = useMemo(() => chats.filter(c => !q || (c.title + c.messages.map(m => m.content).join(' ')).toLowerCase().includes(q.toLowerCase()))
@@ -130,47 +159,47 @@ export default function App() {
   const hello = (() => { const h = new Date().getHours(); return h < 5 ? 'Late night' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening' })()
   const starters: [string, string][] = [['Write', 'Help me write '], ['Learn', 'Teach me about '], ['Code', 'Write a function that '], ['Create', '/image '], ['Build', 'Build me a ']]
   const composer = <div className="composer"><div className="box">
-    <textarea ref={ta} rows={1} value={text} placeholder={img ? 'Describe the image you want…' : chat ? 'Reply to HERETICAL…' : 'How can I help you today?'}
+    <textarea ref={ta} rows={1} value={text} placeholder={img ? 'Describe your image...' : chat ? 'Message HERETICAL...' : 'What are you thinking about?'}
       onChange={e => { setText(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 220) + 'px' }}
       onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }} />
     <div className="tools">
-      <button className="ibtn" title="Persona & settings" aria-label="Persona and settings" onClick={() => setModal(true)}>＋</button>
-      <button className={img ? 'pill on' : 'pill'} onClick={() => setImg(!img)}>Image</button>
+      <button className="ibtn" title="Settings" aria-label="Persona and settings" onClick={() => setModal(true)}>+</button>
+      <button className={img ? 'pill on' : 'pill'} onClick={() => setImg(!img)} disabled={!engines.length} title={engines.length ? 'Generate an image' : 'No image engine is enabled in free-only mode'}>Image</button>
       <button className={agent ? 'pill on' : 'pill'} onClick={() => setAgent(!agent)}>Agent</button>
       {img && <>{RATIOS.map(([k, l]) => <button key={k} className={ratio === k ? 'pill on' : 'pill'} onClick={() => setRatio(k)}>{l}</button>)}
         {engines.length > 1 && <Select up value={engine || engines[0]} onChange={v => set({ engine: v })} options={engines.map(e => ({ id: e, label: e }))} />}</>}
       <span className="grow" />
-      <Select up value={model} onChange={v => set({ model: v })} options={models.map(m => ({ id: m.id, label: `${m.name} · ${m.provider}` }))} />
-      {busy ? <button className="go" onClick={() => ctl.current?.abort()} aria-label="Stop">■</button>
-        : <button className="go" onClick={() => send()} disabled={!text.trim()} aria-label="Send">↑</button>}
+      <Select up value={model} onChange={v => set({ model: v })} options={models.map(m => ({ id: m.id, label: `${m.name}  /  ${m.provider}` }))} />
+      {busy ? <button className="go" onClick={() => ctl.current?.abort()} aria-label="Stop">â– </button>
+        : <button className="go" onClick={() => send()} disabled={!text.trim() || !models.length} aria-label="Send">^</button>}
     </div></div>
     {chat && <p className="fine">HERETICAL can make mistakes. Please double-check responses.</p>}</div>
 
   return <Ws.Provider value={openCode}><div className="app">
     <aside className={`side${nav ? ' open' : ''}${min ? ' min' : ''}`}>
       <div className="stop"><span className="logo"><Logo /></span><span className="label brand">HERETICAL</span>
-        <button className="x collapse" onClick={() => setMin(!min)} aria-label="Toggle sidebar">{min ? '⇥' : '⇤'}</button></div>
-      <button className="new" onClick={() => { set({ active: null }); setNav(false) }}><span className="ic">＋</span><span className="label">New chat</span><kbd className="label">Ctrl K</kbd></button>
+        <button className="x collapse" onClick={() => setMin(!min)} aria-label="Toggle sidebar">{min ? 'â‡¥' : ''}</button></div>
+      <button className="new" onClick={() => { set({ active: null }); setNav(false) }}><span className="ic">+</span><span className="label">New chat</span><kbd className="label">Ctrl+K</kbd></button>
       <input className="search label" placeholder="Search chats" value={q} onChange={e => setQ(e.target.value)} />
       <div className="list label"><h4>Recents</h4>{shown.map(c => <div key={c.id} className={c.id === active ? 'item on' : 'item'}>
         {renaming === c.id ? <input className="ren" autoFocus defaultValue={c.title} onBlur={e => { upsert({ ...c, title: e.target.value || c.title }); setRenaming(null) }} onKeyDown={e => e.key === 'Enter' && (e.target as HTMLInputElement).blur()} />
-          : <button onClick={() => { set({ active: c.id }); setNav(false) }} onDoubleClick={() => setRenaming(c.id)}>{c.pinned ? '◆ ' : ''}{c.title}</button>}
-        <button className="x" title="Pin" onClick={() => upsert({ ...c, pinned: !c.pinned })}>◆</button>
-        <button className="x" aria-label="Delete" onClick={() => remove(c.id)}>×</button></div>)}
-        {!shown.length && <p className="none">No chats yet.</p>}</div>
-      <button className="sfoot" onClick={() => setModal(true)}><span className="av">H</span><span className="label">Persona & settings</span></button>
+          : <button onClick={() => { set({ active: c.id }); setNav(false) }} onDoubleClick={() => setRenaming(c.id)}>{c.pinned ? 'â—† ' : ''}{c.title}</button>}
+        <button className="x" title="Pin" onClick={() => upsert({ ...c, pinned: !c.pinned })}>â—†</button>
+        <button className="x" aria-label="Delete" onClick={() => remove(c.id)}>x</button></div>)}
+        {!shown.length && <p className="none">No conversations yet.</p>}</div>
+      <button className="sfoot" onClick={() => setModal(true)}><span className="av">H</span><span className="label">Settings</span></button>
     </aside>
     <main>
-      <header><button className="pill burger" onClick={() => setNav(!nav)}>☰</button>
-        <b className="title">{chat?.title}</b><span className="grow" />
+      <header><button className="pill burger" onClick={() => setNav(!nav)}><Menu size={17} strokeWidth={1.8} aria-hidden="true" /></button>
+        <b className="title">{chat?.title}</b><span className="ai-status" title="Based on local API health and free-model discovery"><i className={models.length ? "status-dot on" : "status-dot"} />{aiStatus}</span><span className="grow" />
         {chat && <button className="pill" onClick={exportMd}>Export</button>}
         <button className={ws ? 'pill on' : 'pill'} onClick={() => setWs(!ws)}>Workspace</button></header>
-      {!chat ? <div className="home"><h1><span className="logo big"><Logo /></span>{hello}</h1>{composer}
-        <div className="chips">{starters.map(([l, t]) => <button key={l} className="pill" onClick={() => { setText(t); if (l === 'Create') setImg(true); if (l === 'Build') setAgent(true); ta.current?.focus() }}>{l}</button>)}</div></div>
+      {!chat ? <div className="home"><section className="welcome"><div className="eyebrow"><span className="live-mark" />A quieter place to think</div><h1><span className="logo big"><Logo /></span>{hello}</h1><p>Make room for ideas, difficult questions and things you want to build.</p></section>{composer}
+        <div className="chips">{starters.filter(([l]) => l !== "Create" || engines.length > 0).map(([l, t]) => <button key={l} className="pill" onClick={() => { setText(t); if (l === 'Create') setImg(true); if (l === 'Build') setAgent(true); ta.current?.focus() }}>{l}</button>)}</div></div>
         : <><div className="scroll" ref={scroller}><div className="thread">{chat.messages.map((m, i) => <Bubble key={i} m={m} last={i === chat.messages.length - 1 || (i === chat.messages.length - 2 && m.role === 'user')}
             live={busy && i === chat.messages.length - 1 && m.prompt === undefined} onRegen={regen} onEdit={edit} />)}</div></div>{composer}</>}
     </main>
-    {modal && <Modal title="Persona & settings" onClose={() => setModal(false)}>
+    {modal && <Modal title="Settings" onClose={() => setModal(false)}>
       <p className="hint">Added to the system prompt for every chat.</p>
       <textarea className="area" rows={5} value={persona} onChange={e => set({ persona: e.target.value })} placeholder="How should HERETICAL behave?" />
       <div className="chips">{PERSONAS.map(p => <button key={p} className="pill" onClick={() => set({ persona: p })}>{p}</button>)}</div>
